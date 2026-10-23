@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.9.5
-# 审计修复：测试解耦 | 路径校验 | active-tier 持久化 | 卸载幂等
+# SmartDNS 智能部署脚本 v7.9.6
+# 修复：主配置直接拼接（不用 include）| 安装前恢复 DNS | 包管理器失败自动降级
 #==========================================================================
 set +e
 
@@ -30,7 +30,6 @@ SDNS_CMD="/usr/local/bin/sdns"
 CONF_DIR="/etc/smartdns/conf.d"
 CONF_40="$CONF_DIR/40.conf"
 CONF_ENH="$CONF_DIR/enhanced.conf"
-CONF_CURRENT="$CONF_DIR/current.conf"
 MAIN_CONF="/etc/smartdns/smartdns.conf"
 TIER_FILE="/etc/smartdns/active-tier"
 UPSTREAM_MODE_FILE="/etc/smartdns/upstream-mode"
@@ -140,7 +139,16 @@ start_smartdns_service() {
     esac
 }
 
-# 测试解耦：不触碰 systemd 服务状态
+# 确保系统 DNS 可用（包管理器操作前调用）
+ensure_system_dns() {
+    if ! timeout 3 nslookup deb.debian.org 8.8.8.8 >/dev/null 2>&1 && \
+       ! timeout 3 nslookup deb.debian.org 1.1.1.1 >/dev/null 2>&1; then
+        log_warn "系统 DNS 不可用，临时写入公共 DNS"
+        [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+        printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+    fi
+}
+
 test_config_safe() {
     local bin="$1" conf="$2"
     [ -x "$bin" ] || { echo "二进制不可执行: $bin" > "$TEST_LOG"; return 1; }
@@ -170,9 +178,7 @@ print_test_result() {
 }
 
 get_current_port() {
-    local conf; conf=$(readlink -f "$CONF_CURRENT" 2>/dev/null)
-    [ -z "$conf" ] && conf="$MAIN_CONF"
-    local p; p=$(grep "^bind" "$conf" 2>/dev/null | grep -o '[0-9]*$' | head -1)
+    local p; p=$(grep "^bind" "$MAIN_CONF" 2>/dev/null | grep -o '[0-9]*$' | head -1)
     [ -z "$p" ] && p=53
     echo "$p"
 }
@@ -180,22 +186,23 @@ get_current_port() {
 get_active_tier() {
     if [ -f "$TIER_FILE" ]; then
         cat "$TIER_FILE"
-    elif [ -L "$CONF_CURRENT" ]; then
-        basename "$(readlink -f "$CONF_CURRENT")" .conf
     else
         echo "40"
     fi
 }
 
-switch_tier_link() {
+# 直接拼接主配置，不用 include
+apply_tier() {
     local tier="$1"
-    if [ "$tier" = "enhanced" ]; then
-        ln -sf enhanced.conf "$CONF_CURRENT"
-        [ "$(readlink -f "$CONF_CURRENT")" = "$(readlink -f "$CONF_ENH")" ] || { log_err "符号链接切换失败"; return 1; }
-    else
-        ln -sf 40.conf "$CONF_CURRENT"
-        [ "$(readlink -f "$CONF_CURRENT")" = "$(readlink -f "$CONF_40")" ] || { log_err "符号链接切换失败"; return 1; }
-    fi
+    local src="$CONF_40"
+    [ "$tier" = "enhanced" ] && src="$CONF_ENH"
+    [ -f "$src" ] || { log_err "档位配置不存在: $src"; return 1; }
+    {
+        echo "# SmartDNS 主配置（直接拼接，不用 include）"
+        echo "# 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK"
+        echo "# 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE | 档位: $tier | 模式: $(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)"
+        cat "$src"
+    } > "$MAIN_CONF"
     echo "$tier" > "$TIER_FILE"
     ACTIVE_TIER="$tier"
     return 0
@@ -224,7 +231,9 @@ module_detect() {
     case "$VIRT_TYPE" in podman|docker|lxc) VIRT_IS_CONTAINER=true ;; *) VIRT_IS_CONTAINER=false ;; esac
     log_info "虚拟化: $VIRT_TYPE (容器: $VIRT_IS_CONTAINER)"
 
-    ARCH=$(get_arch); ensure_tools
+    ARCH=$(get_arch)
+    ensure_system_dns
+    ensure_tools
 
     HAS_IPV4=true; ip route get 1.1.1.1 >/dev/null 2>&1 || HAS_IPV4=false
     check_ipv6_connectivity && HAS_IPV6=true || HAS_IPV6=false
@@ -245,7 +254,7 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装
+# 模块1: 安装（包管理器优先，失败自动降级 GitHub）
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS"
@@ -256,6 +265,9 @@ module_install() {
     fi
     pkill -x smartdns 2>/dev/null; sleep 1
 
+    # 包管理器安装前确保 DNS 可用
+    ensure_system_dns
+
     log_info "尝试包管理器安装..."
     if pkg_install smartdns 3; then
         for p in /usr/sbin/smartdns /usr/bin/smartdns; do
@@ -265,8 +277,9 @@ module_install() {
         [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="$PKG_MGR"
     fi
 
+    # 包管理器失败，自动降级 GitHub
     if [ -z "$SMARTDNS_BIN" ]; then
-        log_warn "包管理器失败，GitHub 下载到 /usr/local/bin/smartdns（隔离测试）"
+        log_warn "包管理器失败，改用 GitHub 二进制（隔离测试）"
         URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
         if github_download "$URL" /tmp/smartdns-gh; then
             chmod +x /tmp/smartdns-gh
@@ -299,7 +312,6 @@ gen_conf() {
     local outfile="$1" bindport="$2" tier="$3"
     cat > "$outfile" << EOF
 # SmartDNS ${tier} 档
-# 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 server-name smartdns
 bind :${bindport}
 cache-size 4096
@@ -380,15 +392,8 @@ module_config() {
     gen_conf "$CONF_40" "$PORT" "40"
     gen_conf "$CONF_ENH" "$PORT" "enhanced"
 
-    cat > "$MAIN_CONF" << EOF
-# SmartDNS v7.9.5 主配置
-# 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
-# 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE | 档位: $ACTIVE_TIER | 模式: $MODE
-include ${CONF_DIR}/current.conf
-EOF
-
-    switch_tier_link "$ACTIVE_TIER"
     echo "$MODE" > "$UPSTREAM_MODE_FILE"
+    apply_tier "$ACTIVE_TIER"
     log_ok "配置已生成 (档位: $ACTIVE_TIER, 模式: $MODE)"
 }
 
@@ -631,7 +636,6 @@ module_uninstall() {
 
     pkill -x smartdns 2>/dev/null; sleep 0.5; pkill -9 -x smartdns 2>/dev/null
 
-    # 无条件清理所有路径
     rm -f /usr/local/bin/smartdns /usr/local/bin/smartdns.bak.* 2>/dev/null
     rm -f /usr/sbin/smartdns /usr/bin/smartdns 2>/dev/null
     apt-get remove -y smartdns 2>/dev/null
@@ -676,7 +680,7 @@ show_menu() {
     fi
     local tier; tier=$(get_active_tier)
     clear 2>/dev/null || echo ""
-    printf "%b┌──── SmartDNS v7.9.5 ────┐%b\n" "$BOLD" "$NC"
+    printf "%b┌──── SmartDNS v7.9.6 ────┐%b\n" "$BOLD" "$NC"
     printf "  状态: %b  重启: %s  崩溃: %s\n" "$S_DOT" "$RESTART_N" "$CRASH_N"
     printf "  版本: %s (%s)\n" "${ver:-未知}" "$SMARTDNS_SOURCE"
     printf "  路径: %s\n" "$bin"
@@ -701,10 +705,6 @@ do_log() { journalctl -u smartdns --no-pager -n 30 2>/dev/null || tail -30 /var/
 do_config() {
     echo "--- 主配置 ($MAIN_CONF) ---"
     cat "$MAIN_CONF" 2>/dev/null
-    echo ""
-    local cur; cur=$(readlink -f "$CONF_CURRENT" 2>/dev/null)
-    echo "--- 当前档位配置 ($cur) ---"
-    [ -f "$cur" ] && cat "$cur"
 }
 
 do_restart() {
@@ -727,27 +727,28 @@ do_switch_upstream() {
     select_tier "$MODE"
     gen_conf "$CONF_40" "$PORT" "40"
     gen_conf "$CONF_ENH" "$PORT" "enhanced"
-    switch_tier_link "$ACTIVE_TIER"
     echo "$MODE" > "$UPSTREAM_MODE_FILE"
+    apply_tier "$ACTIVE_TIER"
     do_restart
 }
 
 do_update() {
     printf "  1.apt升级 2.GitHub最新(隔离测试) 3.指定版本 4.恢复包管理器版本 0.返回: "; read -r c
     case "$c" in
-        1) apt-get update -qq; apt-get install -y --only-upgrade smartdns; do_restart; return ;;
+        1) ensure_system_dns; apt-get update -qq; apt-get install -y --only-upgrade smartdns; do_restart; return ;;
         2) URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}" ;;
         3) printf "版本(如 Release47.1): "; read -r TAG; URL="https://github.com/pymumu/smartdns/releases/download/${TAG}/smartdns-${ARCH}" ;;
         4)
             printf "  恢复包管理器版本..."
             rm -f /usr/local/bin/smartdns
+            ensure_system_dns
             apt-get install -y --reinstall smartdns 2>/dev/null
             local b; b=$(command -v smartdns 2>/dev/null)
             [ -n "$b" ] && [ -x "$b" ] && SMARTDNS_BIN="$b" && SMARTDNS_SOURCE="$PKG_MGR"
             SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)
             SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
             select_tier "$(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)"
-            switch_tier_link "$ACTIVE_TIER"
+            apply_tier "$ACTIVE_TIER"
             do_restart
             return
             ;;
@@ -774,7 +775,7 @@ do_update() {
         fi
 
         select_tier "$(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)"
-        switch_tier_link "$ACTIVE_TIER"
+        apply_tier "$ACTIVE_TIER"
         do_restart
     else
         rm -f /tmp/smartdns-gh
@@ -816,8 +817,8 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
 
-    printf "%bSmartDNS v7.9.5%b\n" "$BOLD$BLUE" "$NC"
-    printf "审计修复：测试解耦 | 路径校验 | active-tier | 卸载幂等\n\n"
+    printf "%bSmartDNS v7.9.6%b\n" "$BOLD$BLUE" "$NC"
+    printf "主配置直接拼接 | 安装前恢复 DNS | 包管理器失败自动降级 GitHub\n\n"
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     module_menu
 }
