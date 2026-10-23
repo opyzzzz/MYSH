@@ -1,8 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.7.0-alt7
-# PID 文件路径 /var/run → /run (systemd 兼容)
-# alt7: 修复 write_resolv 软链接 / OpenRC 守护 PID / 版本号解析 / 端口检测
+# SmartDNS 智能部署脚本 v7.7.0-alt9
+# 基线 alt8，仅菜单新增：重启次数 / 崩溃次数
 #==========================================================================
 set +e
 
@@ -74,19 +73,22 @@ get_arch() {
     esac
 }
 
-# [修复3] 简化正则：只提取 Release 后的主版本号，去除 -i 和小数点干扰
 get_version_number() {
-    local ver_output=$("$1" -v 2>&1)
-    echo "$ver_output" | grep -o 'Release[0-9]*' | grep -o '[0-9]*' | head -1
+    local ver_output=$(timeout 3 "$1" -v 2>&1)
+    local num
+    num=$(echo "$ver_output" | grep -o 'Release[0-9]*' | grep -o '[0-9]*' | head -1)
+    [ -z "$num" ] && num=0
+    echo "$num"
 }
 
-# [修复4] 补充 ss 检查；/proc 作为 fallback
 port_in_use() {
-    local port_hex=$(printf "%04X" "$1")
-    if command -v ss >/dev/null 2>&1; then
-        ss -tln 2>/dev/null | grep -q ":${1} " && return 0
-    fi
+    local p="$1"
+    fuser "${p}/udp" >/dev/null 2>&1 && return 0
+    local port_hex=$(printf "%04X" "$p")
     grep -q ":$port_hex " /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | grep -q ":${p} " && return 0
+    fi
     return 1
 }
 
@@ -107,6 +109,9 @@ ensure_tools() {
     detect_busybox
     if [ -z "$BB" ]; then case "$PKG_MGR" in apk) pkg_install busybox 2 ;; apt) pkg_install busybox 2 ;; esac; detect_busybox; fi
     if ! command -v inotifywait >/dev/null 2>&1 && ! command -v inotifyd >/dev/null 2>&1; then pkg_install inotify-tools 3; fi
+    if ! command -v dig >/dev/null 2>&1; then
+        case "$PKG_MGR" in apk) pkg_install bind-tools 2 ;; apt) pkg_install dnsutils 2 ;; esac
+    fi
 }
 
 dns_query() {
@@ -129,7 +134,6 @@ detect_inotify() {
 
 safe_rc_add() { local service="$1" runlevel="${2:-default}"; if ! rc-update show 2>/dev/null | grep -q "$service.*$runlevel"; then rc-update add "$service" "$runlevel" 2>/dev/null; fi; }
 
-# [修复1] 先删除软链接再写入，避免跟随软链接写到目标文件
 write_resolv() {
     if [ -L /etc/resolv.conf ]; then
         rm -f /etc/resolv.conf
@@ -219,7 +223,7 @@ module_install() {
         if pkg_install smartdns 3; then SMARTDNS_BIN="/usr/sbin/smartdns"; [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN="/usr/bin/smartdns"; [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=$(which smartdns 2>/dev/null); [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="$PKG_MGR" && log_ok "包管理器安装成功"; fi
     fi
     if [ -z "$SMARTDNS_BIN" ] || [ ! -x "$SMARTDNS_BIN" ]; then log_err "所有安装方式均失败"; exit 1; fi
-    SMARTDNS_VER=$("$SMARTDNS_BIN" -v 2>&1 | head -1); SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
+    SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1); SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
     [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_VER_NEW=true || IS_VER_NEW=false
     log_info "版本: $SMARTDNS_VER (来源: $SMARTDNS_SOURCE)"
     [ "$IS_VER_NEW" = true ] && log_ok "支持 upstream-group 自动降级"
@@ -272,7 +276,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.7.0-alt7
+# SmartDNS 配置 v7.7.0-alt9
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -356,7 +360,6 @@ module_dns_takeover() {
     detect_inotify
     [ -z "$INOTIFY_CMD" ] && log_warn "inotify 工具不可用，将使用轻量级轮询 (5秒间隔)" || log_info "inotify 工具: $INOTIFY_CMD"
     
-    # ── 备份原始 DNS（只一次）──
     if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
         [ ! -f /etc/resolv.conf.smartdns.orig ] && cp /etc/resolv.conf /etc/resolv.conf.smartdns.orig 2>/dev/null
     fi
@@ -364,7 +367,6 @@ module_dns_takeover() {
         cat /etc/resolv.conf 2>/dev/null > /etc/resolv.conf.smartdns.orig 2>/dev/null
     fi
     
-    # ── 从模板文件统一提取 DNS 值 ──
     local dns_list; local dns_yaml; local dns_list_grep
     if [ -f "$RESOLV_TEMPLATE" ]; then
         dns_list=$(grep "^nameserver" "$RESOLV_TEMPLATE" 2>/dev/null | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
@@ -385,7 +387,6 @@ module_dns_takeover() {
     BACKUP_LIST="/etc/smartdns/dns-config-backup.txt"
     > "$BACKUP_LIST"
     
-    # 1. cloud-init
     if command -v cloud-init >/dev/null 2>&1; then
         mkdir -p /etc/cloud/cloud.cfg.d
         cat > /etc/cloud/cloud.cfg.d/99-smartdns-dns.cfg << EOF
@@ -397,7 +398,6 @@ EOF
         log_info "cloud-init: DNS → ${dns_list}"
     fi
     
-    # 2. systemd-resolved
     if [ "$INIT_TYPE" = "systemd" ] && command -v resolvectl >/dev/null 2>&1; then
         mkdir -p /etc/systemd/resolved.conf.d
         cat > /etc/systemd/resolved.conf.d/smartdns.conf << EOF
@@ -421,7 +421,6 @@ EOF
         log_info "systemd-resolved: 上游 → ${dns_list}"
     fi
     
-    # 3. dhclient
     if [ "$HAS_IPV4" = true ] && [ -f /etc/dhcp/dhclient.conf ]; then
         cp /etc/dhcp/dhclient.conf /etc/dhcp/dhclient.conf.smartdns.bak 2>/dev/null
         echo "/etc/dhcp/dhclient.conf:RESTORE:/etc/dhcp/dhclient.conf.smartdns.bak" >> "$BACKUP_LIST"
@@ -431,7 +430,6 @@ EOF
         log_info "dhclient: DNS → 127.0.0.1"
     fi
     
-    # 4. udhcpc
     if [ -f /etc/udhcpc/udhcpc.conf ]; then
         cp /etc/udhcpc/udhcpc.conf /etc/udhcpc/udhcpc.conf.smartdns.bak 2>/dev/null
         echo "/etc/udhcpc/udhcpc.conf:RESTORE:/etc/udhcpc/udhcpc.conf.smartdns.bak" >> "$BACKUP_LIST"
@@ -443,7 +441,6 @@ EOF
         log_info "udhcpc: 不再写 resolv.conf"
     fi
     
-    # 5. systemd-networkd
     if [ "$INIT_TYPE" = "systemd" ] && [ -d /etc/systemd/network ]; then
         for netconf in /etc/systemd/network/*.network; do
             [ -f "$netconf" ] || continue
@@ -457,7 +454,6 @@ EOF
         done
     fi
     
-    # 6. NetworkManager
     if command -v nmcli >/dev/null 2>&1; then
         local conn; conn=$(nmcli -t -f NAME con show --active 2>/dev/null | head -1)
         if [ -n "$conn" ]; then
@@ -474,7 +470,6 @@ EOF
         fi
     fi
     
-    # 7. Alpine ifupdown
     if [ -f /etc/network/interfaces ]; then
         if grep -q "iface.*inet dhcp" /etc/network/interfaces 2>/dev/null; then
             local iface4; iface4=$(grep "iface.*inet dhcp" /etc/network/interfaces | awk '{print $2}')
@@ -498,21 +493,15 @@ EOF
         fi
     fi
     
-    # ── 写入当前 DNS ──
     if [ "$TAKEOVER_STRATEGY" != "resolved" ]; then write_resolv; fi
     cat "$RESOLV_TEMPLATE" > "$RESOLV_BACKUP"; chmod 644 "$RESOLV_BACKUP" 2>/dev/null
     
-    # [修复1] 写入后验证非软链接
     if [ -L /etc/resolv.conf ]; then
         log_warn "resolv.conf 仍为软链接，尝试强制替换"
         rm -f /etc/resolv.conf
         write_resolv
         [ -L /etc/resolv.conf ] && log_err "软链接替换失败，请手动检查" || log_ok "软链接已替换为静态文件"
     fi
-    
-    # ═══════════════════════════════════════
-    # 第二层：启动覆盖
-    # ═══════════════════════════════════════
     
     if [ "$INIT_TYPE" = "openrc" ]; then
         log_info "创建 Alpine 启动覆盖脚本"; mkdir -p /etc/local.d
@@ -540,12 +529,7 @@ SSTART
         systemctl daemon-reload 2>/dev/null; systemctl enable resolv-fix.service 2>/dev/null; log_ok "systemd oneshot 服务已创建"
     fi
     
-    # ═══════════════════════════════════════
-    # 第三层：DNS 文件守护
-    # ═══════════════════════════════════════
-    
     log_info "部署 DNS 文件守护"
-    # [修复1] 守护脚本 restore_dns 中同样处理软链接
     if [ "$INIT_TYPE" = "systemd" ]; then
         cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
@@ -560,7 +544,6 @@ elif command -v inotifyd >/dev/null 2>&1; then while true; do inotifyd - "\$TARG
 else while true; do sleep 5; restore_dns; done; fi
 GUARD
     else
-        # [修复2] 守护脚本内部不再写 PID 文件，由父 shell 捕获 $!
         cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
 TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"
@@ -601,19 +584,16 @@ GSTART
 echo $! > /run/resolv-guard.pid
 OGSTART
         chmod +x /etc/local.d/resolv-guard.start
-        # [修复2] 父 shell 捕获后台 PID
         "$GUARD_SCRIPT" &
         GUARD_PID=$!
         echo "$GUARD_PID" > "$PID_FILE"
         safe_rc_add local default
     else
-        # [修复2] 父 shell 捕获后台 PID
         "$GUARD_SCRIPT" &
         GUARD_PID=$!
         echo "$GUARD_PID" > "$PID_FILE"
     fi
     
-    # ── 验证 ──
     local issues; issues=0
     [ -L /etc/resolv.conf ] && { log_warn "resolv.conf 仍是软链接"; issues=$((issues+1)); }
     if [ -f /etc/cloud/cloud.cfg.d/99-smartdns-dns.cfg ]; then
@@ -638,19 +618,17 @@ module_service() {
     echo "" > /var/log/smartdns.log 2>/dev/null
     case "$INIT_TYPE" in
         systemd)
-            cat > /etc/systemd/system/smartdns.service << 'SVC'
+            cat > /etc/systemd/system/smartdns.service << SVC
 [Unit]
 Description=SmartDNS (DoH+DoT+UDP)
 After=network-online.target
 Wants=network-online.target
 [Service]
-Type=forking
-ExecStart=/usr/bin/smartdns -c /etc/smartdns/smartdns.conf
-PIDFile=/run/smartdns.pid
-ExecReload=/bin/kill -HUP $MAINPID
+Type=simple
+ExecStart=${SMARTDNS_BIN} -c /etc/smartdns/smartdns.conf -f
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
-RestartSec=3
-WatchdogSec=30
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
 SVC
@@ -659,31 +637,32 @@ SVC
             if [ ! -f /etc/init.d/smartdns ]; then
                 cat > /etc/init.d/smartdns << OSVC
 #!/sbin/openrc-run
-name="SmartDNS"; command="/usr/bin/smartdns"; command_args="-c /etc/smartdns/smartdns.conf"; command_background=true; pidfile="/run/smartdns.pid"
+name="SmartDNS"; command="${SMARTDNS_BIN}"; command_args="-c /etc/smartdns/smartdns.conf -f"; command_background=true; pidfile="/run/smartdns.pid"
 depend() { need net; after firewall; }
 OSVC
                 chmod +x /etc/init.d/smartdns
             fi
             safe_rc_add smartdns default; rc-service smartdns start 2>/dev/null; sleep 2 ;;
-        *) /usr/bin/smartdns -c /etc/smartdns/smartdns.conf & sleep 2 ;;
+        *) "$SMARTDNS_BIN" -c /etc/smartdns/smartdns.conf -f & sleep 2 ;;
     esac
     
     [ "$INIT_TYPE" = "systemd" ] && systemctl start resolv-guard.service 2>/dev/null
     
-    # [修复4] 启动后实际验证，失败时输出端口占用诊断
-    if pgrep smartdns >/dev/null 2>&1; then
-        log_ok "SmartDNS 已启动"
+    local started=false
+    pgrep -x smartdns >/dev/null 2>&1 && started=true
+    if $started && command -v dig >/dev/null 2>&1; then
+        dig @127.0.0.1 google.com +short +time=3 +tries=1 2>/dev/null | grep -qE '^[0-9]' || started=false
+    fi
+    if $started; then
+        log_ok "SmartDNS 已启动并正常解析"
     else
-        log_err "启动失败，日志:"
+        log_err "启动或解析异常，日志:"
         tail -20 /var/log/smartdns.log 2>/dev/null
         log_warn "端口 ${PORT} 占用情况:"
         if command -v ss >/dev/null 2>&1; then
-            ss -tlnp 2>/dev/null | grep ":${PORT}" || echo "  (ss 未发现端口 ${PORT} 监听)"
-        elif command -v netstat >/dev/null 2>&1; then
-            netstat -tlnp 2>/dev/null | grep ":${PORT}" || echo "  (netstat 未发现端口 ${PORT} 监听)"
-        else
-            echo "  (ss/netstat 均不可用)"
+            ss -tlnp 2>/dev/null | grep ":${PORT}" || echo "  (ss 未发现 TCP ${PORT} 监听)"
         fi
+        fuser "${PORT}/udp" 2>&1 || echo "  (UDP ${PORT} 未占用)"
         exit 1
     fi
 }
@@ -810,6 +789,9 @@ EOF
     log_ok "DNS 已恢复"
     
     rm -f /usr/bin/smartdns /usr/sbin/smartdns /usr/local/bin/smartdns
+    rm -f /usr/bin/smartdns.bak /usr/bin/smartdns.bak.* 2>/dev/null
+    rm -f /usr/local/bin/smartdns.bak.* 2>/dev/null
+    rm -f /tmp/smartdns-new /tmp/smartdns-gh /tmp/smartdns-test* /tmp/smartdns-$$ 2>/dev/null
     rm -rf /etc/smartdns; rm -f /var/log/smartdns.log* "$DEPLOY_LOG"
     apt-get remove -y smartdns 2>/dev/null; apk del smartdns 2>/dev/null
     
@@ -823,7 +805,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 三分区菜单
+# 模块7: 三分区菜单（alt9 新增重启/崩溃计数）
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -833,6 +815,7 @@ install_shortcut() {
 CACHE_TIME=0; CACHE_S_DOT=""; CACHE_G_DOT=""; CACHE_SYS_DNS=""
 CACHE_DOH_G=""; CACHE_DOH_C=""; CACHE_DOT_G=""; CACHE_DOT_C=""
 CACHE_UDP_G=""; CACHE_UDP_C=""
+CACHE_RESTART_N=""; CACHE_CRASH_N=""
 
 get_metrics() {
     local now=$(date +%s)
@@ -840,6 +823,7 @@ get_metrics() {
         S_DOT="$CACHE_S_DOT"; G_DOT="$CACHE_G_DOT"; SYS_DNS="$CACHE_SYS_DNS"
         DOH_G="$CACHE_DOH_G"; DOH_C="$CACHE_DOH_C"; DOT_G="$CACHE_DOT_G"; DOT_C="$CACHE_DOT_C"
         UDP_G="$CACHE_UDP_G"; UDP_C="$CACHE_UDP_C"
+        RESTART_N="$CACHE_RESTART_N"; CRASH_N="$CACHE_CRASH_N"
         return
     fi
     
@@ -882,9 +866,17 @@ get_metrics() {
         DOT_C="${NC}○${NC}"
     fi
     
+    RESTART_N=$(systemctl show smartdns -p NRestarts --value 2>/dev/null || echo "0")
+    CRASH_N=0
+    if [ "$INIT_TYPE" = "systemd" ]; then
+        CRASH_N=$(journalctl -u smartdns --no-pager 2>/dev/null | grep -c "signal 6")
+    fi
+    [ -f /var/log/smartdns.log ] && CRASH_N=$((CRASH_N + $(grep -c "signal 6" /var/log/smartdns.log 2>/dev/null)))
+    
     CACHE_TIME=$now; CACHE_S_DOT="$S_DOT"; CACHE_G_DOT="$G_DOT"; CACHE_SYS_DNS="$SYS_DNS"
     CACHE_DOH_G="$DOH_G"; CACHE_DOH_C="$DOH_C"; CACHE_DOT_G="$DOT_G"; CACHE_DOT_C="$DOT_C"
     CACHE_UDP_G="$UDP_G"; CACHE_UDP_C="$UDP_C"
+    CACHE_RESTART_N="$RESTART_N"; CACHE_CRASH_N="$CRASH_N"
 }
 
 show_menu() {
@@ -893,6 +885,7 @@ show_menu() {
     printf "%b\n" "${BOLD}┌────────── 系统状态 ──────────┐${NC}"
     printf "  %b SmartDNS  %b 守护\n" "$S_DOT" "$G_DOT"
     printf "  系统 DNS:  %s\n" "$SYS_DNS"
+    printf "  重启次数: %s   崩溃次数: %s\n" "$RESTART_N" "$CRASH_N"
     printf "%b\n" "${BOLD}├────────── 加密 DNS ──────────┤${NC}"
     printf "  DoH Google:     %b\n" "$DOH_G"
     printf "  DoH Cloudflare: %b\n" "$DOH_C"
@@ -932,8 +925,8 @@ do_edit() {
 
 do_restart() {
     printf "  重启中... "
-    case "$INIT_TYPE" in systemd) systemctl restart smartdns 2>/dev/null ;; openrc) rc-service smartdns restart 2>/dev/null ;; *) pkill -x smartdns 2>/dev/null; sleep 1; smartdns -c /etc/smartdns/smartdns.conf & ;; esac
-    sleep 2; pgrep smartdns >/dev/null 2>&1 && printf "%b\n" "${GREEN}✓ 已重启${NC}" || printf "%b\n" "${RED}✗ 失败${NC}"
+    case "$INIT_TYPE" in systemd) systemctl restart smartdns 2>/dev/null ;; openrc) rc-service smartdns restart 2>/dev/null ;; *) pkill -x smartdns 2>/dev/null; sleep 1; "$SMARTDNS_BIN" -c /etc/smartdns/smartdns.conf -f & ;; esac
+    sleep 2; pgrep -x smartdns >/dev/null 2>&1 && printf "%b\n" "${GREEN}✓ 已重启${NC}" || printf "%b\n" "${RED}✗ 失败${NC}"
     CACHE_TIME=0
 }
 
@@ -943,7 +936,7 @@ do_update() {
     clear 2>/dev/null || echo ""; printf "%b\n" "${BOLD}── 版本管理 ──${NC}"
     if ! command -v curl >/dev/null 2>&1; then printf "%b\n" "${RED}  需要 curl${NC}"; return; fi
     
-    CURRENT_TAG=$("$SMARTDNS_BIN" -v 2>&1 | grep 'Release' | head -1 | sed 's/.*\(Release[0-9.]*\).*/\1/')
+    CURRENT_TAG=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | grep 'Release' | head -1 | sed 's/.*\(Release[0-9.]*\).*/\1/')
     printf "  当前版本: %b\n" "${GREEN}${CURRENT_TAG:-未知}${NC}"
     
     LATEST_JSON=$(curl -sL --max-time 10 https://api.github.com/repos/pymumu/smartdns/releases/latest 2>/dev/null)
@@ -973,10 +966,21 @@ do_update() {
     ARCH=$(get_arch); URL="https://github.com/pymumu/smartdns/releases/download/${TARGET_TAG}/smartdns-${ARCH}"
     
     if github_download "$URL" "/tmp/smartdns-new"; then
+        chmod +x /tmp/smartdns-new
+        [ -x /tmp/smartdns-new ] || { log_err "下载文件不可执行"; rm -f /tmp/smartdns-new; return; }
         cp /usr/bin/smartdns /usr/bin/smartdns.bak 2>/dev/null
-        mv /tmp/smartdns-new /usr/bin/smartdns; chmod +x /usr/bin/smartdns
-        SMARTDNS_BIN="/usr/bin/smartdns"; do_restart
-        printf "%b\n" "${GREEN}✓ 切换完成${NC}"
+        if mv /tmp/smartdns-new /usr/bin/smartdns; then
+            chmod +x /usr/bin/smartdns
+            if [ ! -x /usr/bin/smartdns ]; then
+                log_err "写入后不可执行，回滚"
+                [ -f /usr/bin/smartdns.bak ] && cp /usr/bin/smartdns.bak /usr/bin/smartdns && chmod +x /usr/bin/smartdns
+                return
+            fi
+            SMARTDNS_BIN="/usr/bin/smartdns"; do_restart
+            printf "%b\n" "${GREEN}✓ 切换完成${NC}"
+        else
+            log_err "写入失败"
+        fi
     else printf "%b\n" "${RED}✗ 下载失败${NC}"; fi
 }
 
@@ -984,7 +988,7 @@ module_menu() {
     install_shortcut
     if [ $# -gt 0 ]; then
         case "$1" in
-            s|status) get_metrics; printf "DNS:%b 守护:%b\n" "$S_DOT" "$G_DOT"; return ;;
+            s|status) get_metrics; printf "DNS:%b 守护:%b 重启:%s 崩溃:%s\n" "$S_DOT" "$G_DOT" "$RESTART_N" "$CRASH_N"; return ;;
             l|log) do_log; return ;; t|test) do_test; return ;;
             c|config) do_config; return ;; e|edit) do_edit; return ;; r|restart) do_restart; return ;;
             f|flush) do_flush; return ;; u|update) do_update; return ;; uninstall) module_uninstall; return ;;
@@ -1007,11 +1011,19 @@ main() {
     if [ "$(readlink -f "$0" 2>/dev/null || echo "$0")" = "$SDNS_CMD" ]; then
         [ -f /etc/smartdns/smartdns.conf ] && PORT=$(grep "^bind" /etc/smartdns/smartdns.conf | grep -o '[0-9]*$' | head -1); [ -z "$PORT" ] && PORT=53
         [ -f /etc/alpine-release ] && OS_TYPE="alpine"; [ -d /run/systemd/system ] && INIT_TYPE="systemd"
+        SMARTDNS_BIN=$(command -v smartdns 2>/dev/null)
+        [ -z "$SMARTDNS_BIN" ] && SMARTDNS_BIN="/usr/bin/smartdns"
+        if [ -x "$SMARTDNS_BIN" ]; then
+            SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)
+            SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
+            [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_VER_NEW=true || IS_VER_NEW=false
+        fi
+        SMARTDNS_SOURCE="GitHub"
         detect_busybox; detect_inotify; module_menu "$@"; exit 0
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; printf "%b\n" "${BOLD}SmartDNS 智能部署 v7.7.0-alt7${NC}"; echo "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; printf "%b\n" "${BOLD}SmartDNS 智能部署 v7.7.0-alt9${NC}"; echo "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; printf "%b\n" "管理命令: ${GREEN}sdns${NC}"; echo "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  版本管理"; echo "  sdns    菜单"
     module_menu
