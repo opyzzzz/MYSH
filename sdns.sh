@@ -56,8 +56,11 @@ check_debian12() {
     ver=$(cat /etc/debian_version | cut -d. -f1)
     if [[ "$ver" != "12" ]]; then
         log_warn "当前 Debian 版本为 $ver，脚本针对 Debian 12 优化，继续可能存在问题"
-        read -rp "是否继续? [y/N]: " ans
-        [[ "${ans,,}" != "y" ]] && exit 1
+        local ans=""
+        read -rp "是否继续? [y/N]: " ans || true
+        if [[ "${ans,,}" != "y" ]]; then
+            exit 1
+        fi
     fi
 }
 
@@ -76,12 +79,10 @@ detect_arch() {
 # 依赖管理模块
 # =============================================================================
 
-# 检测单个命令是否存在
 check_command() {
     command -v "$1" &>/dev/null
 }
 
-# 汇总缺失依赖，输出 "命令名:包名:必需性" 行
 detect_missing_deps() {
     local entry cmd pkg req
     for entry in "${DEPENDENCIES[@]}"; do
@@ -92,7 +93,6 @@ detect_missing_deps() {
     done
 }
 
-# 安装缺失的必需依赖
 install_deps() {
     local missing_required=()
     local missing_optional=()
@@ -108,12 +108,10 @@ install_deps() {
         fi
     done < <(detect_missing_deps)
 
-    # 可选项仅提示，不主动安装
     if [[ ${#missing_optional[@]} -gt 0 ]]; then
         log_warn "可选依赖未安装: ${missing_optional[*]} (不影响核心功能，安装后可获得更精确的解析检测)"
     fi
 
-    # 必需项为空则直接返回
     if [[ ${#missing_required[@]} -eq 0 ]]; then
         log_info "必需依赖已满足"
         return 0
@@ -122,7 +120,6 @@ install_deps() {
     log_warn "检测到缺失的必需依赖: ${missing_required[*]}"
     log_info "正在通过 apt 安装..."
 
-    # apt update 失败不阻断，继续尝试安装
     if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null; then
         log_warn "apt update 失败，尝试使用已有缓存继续安装"
     fi
@@ -132,14 +129,13 @@ install_deps() {
         return 1
     fi
 
-    # 安装后验证
     local pkg_name
     for pkg_name in "${missing_required[@]}"; do
         local cmd_name=""
         local entry
         for entry in "${DEPENDENCIES[@]}"; do
-            IFS=':' read -r cmd_name _ _ <<< "$entry"
             if [[ "${entry}" == *":${pkg_name}:"* ]]; then
+                IFS=':' read -r cmd_name _ _ <<< "$entry"
                 break
             fi
         done
@@ -153,13 +149,12 @@ install_deps() {
     return 0
 }
 
-# 入口统一调用
 ensure_dependencies() {
     log_info "检查脚本运行依赖..."
-    install_deps || {
+    if ! install_deps; then
         log_error "依赖检查未通过，脚本退出"
         exit 1
-    }
+    fi
 }
 
 # =============================================================================
@@ -493,8 +488,11 @@ EOF
 
 uninstall_all() {
     log_warn "即将卸载 SmartDNS 并恢复系统 DNS"
-    read -rp "确认卸载? [y/N]: " ans
-    [[ "${ans,,}" != "y" ]] && return 0
+    local ans=""
+    read -rp "确认卸载? [y/N]: " ans || true
+    if [[ "${ans,,}" != "y" ]]; then
+        return 0
+    fi
 
     systemctl stop smartdns 2>/dev/null || true
     systemctl disable smartdns 2>/dev/null || true
@@ -567,7 +565,7 @@ main_menu() {
         echo "  6. 卸载 SmartDNS 并恢复系统 DNS"
         echo "  0. 退出"
         echo "=========================================="
-        read -rp "请选择 [0-6]: " choice
+        read -rp "请选择 [0-6]: " choice || true
 
         case "$choice" in
             1)
@@ -579,7 +577,8 @@ main_menu() {
                 log_info "全部完成! 快捷命令: sdns"
                 ;;
             2)
-                read -rp "请输入 SmartDNS 版本号 (如 48.4): " ver
+                local ver=""
+                read -rp "请输入 SmartDNS 版本号 (如 48.4): " ver || true
                 if [[ -z "$ver" ]]; then
                     log_error "版本号不能为空"
                     continue
