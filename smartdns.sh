@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.9.6
-# 修复：主配置直接拼接（不用 include）| 安装前恢复 DNS | 包管理器失败自动降级
+# SmartDNS 智能部署脚本 v7.9.7
+# 修复：菜单无效输入提示 | do_update 时序 | 保留 apply_tier 直接拼接
 #==========================================================================
 set +e
 
@@ -139,7 +139,6 @@ start_smartdns_service() {
     esac
 }
 
-# 确保系统 DNS 可用（包管理器操作前调用）
 ensure_system_dns() {
     if ! timeout 3 nslookup deb.debian.org 8.8.8.8 >/dev/null 2>&1 && \
        ! timeout 3 nslookup deb.debian.org 1.1.1.1 >/dev/null 2>&1; then
@@ -191,7 +190,6 @@ get_active_tier() {
     fi
 }
 
-# 直接拼接主配置，不用 include
 apply_tier() {
     local tier="$1"
     local src="$CONF_40"
@@ -254,18 +252,16 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装（包管理器优先，失败自动降级 GitHub）
+# 模块1: 安装
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS"
 
-    # 备份本地二进制而非删除
     if [ -f /usr/local/bin/smartdns ]; then
         mv /usr/local/bin/smartdns "/usr/local/bin/smartdns.bak.$(date +%s)" 2>/dev/null
     fi
     pkill -x smartdns 2>/dev/null; sleep 1
 
-    # 包管理器安装前确保 DNS 可用
     ensure_system_dns
 
     log_info "尝试包管理器安装..."
@@ -277,7 +273,6 @@ module_install() {
         [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="$PKG_MGR"
     fi
 
-    # 包管理器失败，自动降级 GitHub
     if [ -z "$SMARTDNS_BIN" ]; then
         log_warn "包管理器失败，改用 GitHub 二进制（隔离测试）"
         URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
@@ -612,7 +607,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载（幂等）
+# 模块6: 卸载
 #==================================================
 module_uninstall() {
     printf "\n%b确认卸载？输入 yes: %b" "$YELLOW" "$NC"
@@ -680,7 +675,7 @@ show_menu() {
     fi
     local tier; tier=$(get_active_tier)
     clear 2>/dev/null || echo ""
-    printf "%b┌──── SmartDNS v7.9.6 ────┐%b\n" "$BOLD" "$NC"
+    printf "%b┌──── SmartDNS v7.9.7 ────┐%b\n" "$BOLD" "$NC"
     printf "  状态: %b  重启: %s  崩溃: %s\n" "$S_DOT" "$RESTART_N" "$CRASH_N"
     printf "  版本: %s (%s)\n" "${ver:-未知}" "$SMARTDNS_SOURCE"
     printf "  路径: %s\n" "$bin"
@@ -707,6 +702,13 @@ do_config() {
     cat "$MAIN_CONF" 2>/dev/null
 }
 
+do_edit() {
+    command -v nano >/dev/null 2>&1 || pkg_install nano 2 >/dev/null 2>&1
+    if command -v nano >/dev/null 2>&1; then nano "$MAIN_CONF"
+    else vi "$MAIN_CONF"; fi
+    printf "%b修改后选 5 重启生效%b\n" "$YELLOW" "$NC"
+}
+
 do_restart() {
     case "$INIT_TYPE" in
         systemd) systemctl restart smartdns ;;
@@ -718,9 +720,22 @@ do_restart() {
     CACHE_TIME=0
 }
 
+do_flush() { pkill -HUP -x smartdns 2>/dev/null && printf "%b✓ 缓存已清除%b\n" "$GREEN" "$NC" || printf "%b✗ 未运行%b\n" "$RED" "$NC"; }
+
 do_switch_upstream() {
-    printf "  1.DoH+UDP  2.纯UDP  0.返回: "; read -r c
-    case "$c" in 1) MODE="doh_udp" ;; 2) MODE="udp_only" ;; *) return ;; esac
+    clear 2>/dev/null || echo ""
+    printf "%b── 切换上游 ──%b\n" "$BOLD" "$NC"
+    printf "  当前模式: %s\n\n" "$(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)"
+    printf "  1. DoH + UDP 兜底（推荐）\n"
+    printf "  2. 纯 UDP\n"
+    printf "  0. 返回\n\n"
+    printf "  选择 [0-2]: "; read -r c
+    case "$c" in
+        1) MODE="doh_udp" ;;
+        2) MODE="udp_only" ;;
+        0) return ;;
+        *) printf "%b无效选择: %s%b\n" "$RED" "$c" "$NC"; sleep 1; return ;;
+    esac
 
     stop_smartdns_service
     PORT=$(get_current_port)
@@ -733,53 +748,107 @@ do_switch_upstream() {
 }
 
 do_update() {
-    printf "  1.apt升级 2.GitHub最新(隔离测试) 3.指定版本 4.恢复包管理器版本 0.返回: "; read -r c
+    clear 2>/dev/null || echo ""
+    printf "%b── 版本管理 ──%b\n" "$BOLD" "$NC"
+    printf "  当前版本: %s\n" "$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)"
+    printf "  当前路径: %s\n" "$SMARTDNS_BIN"
+    printf "  安装来源: %s\n\n" "$SMARTDNS_SOURCE"
+    printf "  1. 包管理器升级（apt/apk）\n"
+    printf "  2. GitHub 最新版（隔离测试）\n"
+    printf "  3. 指定 GitHub 版本（隔离测试）\n"
+    printf "  4. 恢复包管理器版本（apt --reinstall）\n"
+    printf "  0. 返回\n\n"
+    printf "  选择 [0-4]: "; read -r c
+
     case "$c" in
-        1) ensure_system_dns; apt-get update -qq; apt-get install -y --only-upgrade smartdns; do_restart; return ;;
+        1)
+            ensure_system_dns
+            case "$PKG_MGR" in
+                apt) apt-get update -qq 2>/dev/null; apt-get install -y --only-upgrade smartdns 2>/dev/null ;;
+                apk) apk upgrade smartdns 2>/dev/null ;;
+            esac
+            local b; b=$(command -v smartdns 2>/dev/null)
+            [ -n "$b" ] && [ -x "$b" ] && SMARTDNS_BIN="$b" && SMARTDNS_SOURCE="$PKG_MGR"
+            SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)
+            SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
+            do_restart
+            return
+            ;;
         2) URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}" ;;
-        3) printf "版本(如 Release47.1): "; read -r TAG; URL="https://github.com/pymumu/smartdns/releases/download/${TAG}/smartdns-${ARCH}" ;;
+        3)
+            printf "  版本号(如 Release47.1): "; read -r TAG
+            [ -z "$TAG" ] && { printf "%b版本号不能为空%b\n" "$RED" "$NC"; return; }
+            URL="https://github.com/pymumu/smartdns/releases/download/${TAG}/smartdns-${ARCH}"
+            ;;
         4)
             printf "  恢复包管理器版本..."
             rm -f /usr/local/bin/smartdns
             ensure_system_dns
             apt-get install -y --reinstall smartdns 2>/dev/null
             local b; b=$(command -v smartdns 2>/dev/null)
-            [ -n "$b" ] && [ -x "$b" ] && SMARTDNS_BIN="$b" && SMARTDNS_SOURCE="$PKG_MGR"
-            SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)
-            SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
-            select_tier "$(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)"
-            apply_tier "$ACTIVE_TIER"
-            do_restart
+            if [ -n "$b" ] && [ -x "$b" ]; then
+                SMARTDNS_BIN="$b"; SMARTDNS_SOURCE="$PKG_MGR"
+                SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)
+                SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
+                select_tier "$(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)"
+                apply_tier "$ACTIVE_TIER"
+                do_restart
+                printf "%b✓ 已恢复包管理器版本%b\n" "$GREEN" "$NC"
+            else
+                printf "%b✗ 包管理器安装失败%b\n" "$RED" "$NC"
+            fi
             return
             ;;
-        *) return ;;
+        0) return ;;
+        *) printf "%b无效选择: %s%b\n" "$RED" "$c" "$NC"; sleep 1; return ;;
     esac
+
     [ -z "$URL" ] && return
-    github_download "$URL" /tmp/smartdns-gh && chmod +x /tmp/smartdns-gh
+    printf "  下载中..."
+    if ! github_download "$URL" /tmp/smartdns-gh; then
+        printf "%b✗ 下载失败%b\n" "$RED" "$NC"; return
+    fi
+    chmod +x /tmp/smartdns-gh
+    printf "完成\n"
+
+    # 先停服务，避免测试期间状态混乱
+    stop_smartdns_service
+
+    printf "  隔离启动测试（端口 15353 / 10s）...\n"
     printf "bind :15353\nserver 8.8.8.8\n" > "$TEST_CONF"
     if test_config_safe /tmp/smartdns-gh "$TEST_CONF"; then
+        print_test_result 0
         mkdir -p /usr/local/bin
-        mv /tmp/smartdns-gh /usr/local/bin/smartdns || { log_err "写入失败"; return; }
+        if ! mv /tmp/smartdns-gh /usr/local/bin/smartdns; then
+            log_err "写入失败"; return
+        fi
         chmod +x /usr/local/bin/smartdns
         [ -x /usr/local/bin/smartdns ] || { log_err "二进制不可执行"; return; }
         SMARTDNS_BIN="/usr/local/bin/smartdns"; SMARTDNS_SOURCE="GitHub"
         SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)
         SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
+        [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_VER_NEW=true || IS_VER_NEW=false
 
         if [ "$INIT_TYPE" = "systemd" ]; then
             sed "s|^ExecStart=.*|ExecStart=${SMARTDNS_BIN} -c ${MAIN_CONF} -f|" \
                 /etc/systemd/system/smartdns.service > /tmp/smartdns.service.new
-            grep -q "ExecStart=${SMARTDNS_BIN}" /tmp/smartdns.service.new || { log_err "service 替换失败"; return; }
-            mv /tmp/smartdns.service.new /etc/systemd/system/smartdns.service
-            systemctl daemon-reload
+            if grep -q "ExecStart=${SMARTDNS_BIN}" /tmp/smartdns.service.new; then
+                mv /tmp/smartdns.service.new /etc/systemd/system/smartdns.service
+                systemctl daemon-reload
+            else
+                log_err "service 替换失败"; return
+            fi
         fi
 
         select_tier "$(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)"
         apply_tier "$ACTIVE_TIER"
         do_restart
+        printf "%b✓ 已切换到 %s%b\n" "$GREEN" "$SMARTDNS_VER" "$NC"
     else
+        print_test_result 1
         rm -f /tmp/smartdns-gh
         printf "%b测试失败，保持当前版本%b\n" "$YELLOW" "$NC"
+        do_restart
     fi
 }
 
@@ -788,6 +857,7 @@ module_menu() {
     if [ $# -gt 0 ]; then
         case "$1" in
             t|test) do_test ;; l|log) do_log ;; c|config) do_config ;; r|restart) do_restart ;; uninstall) module_uninstall ;;
+            *) echo "用法: sdns [t|l|c|r|uninstall]" ;;
         esac
         return
     fi
@@ -795,8 +865,17 @@ module_menu() {
         show_menu
         printf "选择 [0-9]: "; read -r c 2>/dev/null || break
         case "$c" in
-            1) do_test ;; 2) do_log ;; 3) do_config ;; 5) do_restart ;; 8) module_uninstall; break ;;
-            9) do_switch_upstream ;; 0) break ;;
+            1) do_test ;;
+            2) do_log ;;
+            3) do_config ;;
+            4) do_edit ;;
+            5) do_restart ;;
+            6) do_flush ;;
+            7) do_update ;;
+            8) module_uninstall; break ;;
+            9) do_switch_upstream ;;
+            0) break ;;
+            *) printf "%b无效选择: %s%b\n" "$RED" "$c" "$NC"; sleep 1 ;;
         esac
         [ "$c" != "0" ] && [ "$c" != "8" ] && { printf "回车返回..."; read -r _ 2>/dev/null; }
     done
@@ -810,15 +889,17 @@ main() {
         if [ -n "$SMARTDNS_BIN" ]; then
             SMARTDNS_VER=$(timeout 3 "$SMARTDNS_BIN" -v 2>&1 | head -1)
             SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
+            [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_VER_NEW=true || IS_VER_NEW=false
         fi
         ACTIVE_TIER=$(get_active_tier)
         PKG_MGR="apt"; [ -f /etc/alpine-release ] && PKG_MGR="apk"
+        ARCH=$(get_arch)
         detect_busybox; module_menu "$@"; exit 0
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
 
-    printf "%bSmartDNS v7.9.6%b\n" "$BOLD$BLUE" "$NC"
-    printf "主配置直接拼接 | 安装前恢复 DNS | 包管理器失败自动降级 GitHub\n\n"
+    printf "%bSmartDNS v7.9.7%b\n" "$BOLD$BLUE" "$NC"
+    printf "菜单无效输入提示 | do_update 时序修正 | 直接拼接配置\n\n"
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     module_menu
 }
