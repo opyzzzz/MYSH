@@ -39,6 +39,10 @@ dns-detective
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns-detective.sh | sh
 `````
 
+SDNS
+`````
+curl -sLo /tmp/sdns.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/sdns.sh && bash /tmp/sdns.sh
+`````
 SmartDNS
 `````
 curl -sLo /tmp/sdns.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/smartdns.sh && bash /tmp/sdns.sh
