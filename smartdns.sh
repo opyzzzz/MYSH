@@ -1,7 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.7.0-alt9
-# 基线 alt8，仅菜单新增：重启次数 / 崩溃次数
+# SmartDNS 智能部署脚本 v7.7.1
 #==========================================================================
 set +e
 
@@ -276,7 +275,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.7.0-alt9
+# SmartDNS 配置 v7.7.1
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -796,7 +795,7 @@ EOF
     apt-get remove -y smartdns 2>/dev/null; apk del smartdns 2>/dev/null
     
     echo ""; echo -e "${BOLD}  清理报告:${NC}"; local clean; clean=true
-    pgrep smartdns >/dev/null 2>&1 && { echo -e "    ${RED}⚠ SmartDNS 进程残留${NC}"; clean=false; }
+    pgrep -x smartdns >/dev/null 2>&1 && { echo -e "    ${RED}⚠ SmartDNS 进程残留${NC}"; clean=false; }
     pgrep -f "resolv-guard" >/dev/null 2>&1 && { echo -e "    ${RED}⚠ 守护进程残留${NC}"; clean=false; }
     [ -f /usr/bin/smartdns ] && { echo -e "    ${RED}⚠ 二进制文件残留${NC}"; clean=false; }
     [ -d /etc/smartdns ] && { echo -e "    ${RED}⚠ 配置目录残留${NC}"; clean=false; }
@@ -827,7 +826,7 @@ get_metrics() {
         return
     fi
     
-    pgrep smartdns >/dev/null 2>&1 && S_DOT="${GREEN}●${NC}" || S_DOT="${RED}●${NC}"
+    pgrep -x smartdns >/dev/null 2>&1 && S_DOT="${GREEN}●${NC}" || S_DOT="${RED}●${NC}"
     pgrep -f resolv-guard >/dev/null 2>&1 && G_DOT="${GREEN}●${NC}" || G_DOT="${RED}●${NC}"
     SYS_DNS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
     [ -z "$SYS_DNS" ] && SYS_DNS="未配置"
@@ -1023,7 +1022,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; printf "%b\n" "${BOLD}SmartDNS 智能部署 v7.7.0-alt9${NC}"; echo "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; printf "%b\n" "${BOLD}SmartDNS 智能部署 v7.7.1${NC}"; echo "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; printf "%b\n" "管理命令: ${GREEN}sdns${NC}"; echo "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  版本管理"; echo "  sdns    菜单"
     module_menu
