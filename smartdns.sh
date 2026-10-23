@@ -1,8 +1,8 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.9.0
-# 包管理器优先安装 | DoH 默认启用 + UDP 兜底 | 菜单可切换上游
-# 完整支持 systemd / OpenRC | 适配 LXC 检测 | 显示崩溃与重启次数
+# SmartDNS 智能部署脚本 v7.9.1
+# 包管理器优先 | DoH 默认 + UDP 兜底 | 启动测试隔离端口 | 完整双 init 支持
+# v7.9.1: 修正启动测试（停服务+15353端口+保留stderr+10s）| 版本菜单增加报告与apt回滚
 #==========================================================================
 set +e
 
@@ -32,6 +32,8 @@ SDNS_CMD="/usr/local/bin/sdns"
 UPSTREAM_MODE_FILE="/etc/smartdns/upstream-mode"
 RESOLV_TEMPLATE="/etc/smartdns/resolv.smartdns"
 RESOLV_FALLBACK="/etc/smartdns/resolv.fallback"
+TEST_CONF="/tmp/smartdns-test.conf"
+TEST_LOG="/tmp/smartdns-startup-test.log"
 APT_UPDATED=false; BB=""
 
 detect_busybox() { command -v busybox >/dev/null 2>&1 && BB="busybox"; }
@@ -74,7 +76,6 @@ get_version_number() {
     echo "$ver_output" | grep -o 'Release[0-9]*' | grep -o '[0-9]*' | head -1
 }
 
-# LXC 适配：优先 fuser 查 UDP
 port_in_use_udp() { fuser "$1/udp" >/dev/null 2>&1; }
 
 check_ipv6_connectivity() {
@@ -117,6 +118,59 @@ safe_rc_add() {
 write_resolv() {
     [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
     cat "$RESOLV_TEMPLATE" > /etc/resolv.conf
+}
+
+stop_smartdns_service() {
+    case "$INIT_TYPE" in
+        systemd) systemctl stop smartdns 2>/dev/null ;;
+        openrc) rc-service smartdns stop 2>/dev/null ;;
+    esac
+    pkill -x smartdns 2>/dev/null
+    sleep 1
+}
+
+start_smartdns_service() {
+    case "$INIT_TYPE" in
+        systemd) systemctl start smartdns 2>/dev/null ;;
+        openrc) rc-service smartdns start 2>/dev/null ;;
+        *) [ -n "$SMARTDNS_BIN" ] && "$SMARTDNS_BIN" -c /etc/smartdns/smartdns.conf & ;;
+    esac
+}
+
+# 隔离环境启动测试：停服务、15353 端口、保留 stderr、10 秒
+# 返回 0 通过 / 1 失败；失败原因写入 $TEST_LOG
+test_binary_safe() {
+    local bin="$1"
+    [ -x "$bin" ] || { echo "二进制不可执行: $bin" > "$TEST_LOG"; return 1; }
+
+    stop_smartdns_service
+
+    cat > "$TEST_CONF" << 'TESTEOF'
+bind :15353
+server 8.8.8.8
+TESTEOF
+
+    timeout 10 "$bin" -f -c "$TEST_CONF" > "$TEST_LOG" 2>&1
+    local rc=$?
+
+    start_smartdns_service
+
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 0 ]; then
+        return 0
+    fi
+    return 1
+}
+
+print_test_result() {
+    local rc="$1"
+    printf "  测试日志: %s\n" "$TEST_LOG"
+    if [ "$rc" -eq 0 ]; then
+        printf "%b  ✓ 二进制存活 10 秒，可正常启动%b\n" "$GREEN" "$NC"
+    elif [ "$rc" -eq 1 ]; then
+        printf "%b  ✗ 启动失败，错误摘要:%b\n" "$RED" "$NC"
+        tail -5 "$TEST_LOG" 2>/dev/null | sed 's/^/    /'
+        printf "  常见原因: 架构不匹配 / 缺少库 / LXC 环境限制 / 内部断言\n"
+    fi
 }
 
 #==================================================
@@ -164,12 +218,11 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装 SmartDNS（包管理器优先，GitHub 需验证）
+# 模块1: 安装 SmartDNS（包管理器优先，GitHub 隔离测试）
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS (包管理器优先)"
 
-    # 清理可能覆盖包管理器版本的旧二进制
     rm -f /usr/local/bin/smartdns /usr/bin/smartdns.bak 2>/dev/null
     pkill -x smartdns 2>/dev/null; sleep 1
 
@@ -182,19 +235,17 @@ module_install() {
         [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="$PKG_MGR"
     fi
 
-    # 备选：GitHub，必须通过前台启动测试
     if [ -z "$SMARTDNS_BIN" ]; then
-        log_warn "包管理器安装失败，尝试 GitHub 下载（需通过启动测试）"
+        log_warn "包管理器安装失败，尝试 GitHub 下载（隔离环境启动测试）"
         URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
         if github_download "$URL" /tmp/smartdns-test; then
             chmod +x /tmp/smartdns-test
-            timeout 5 /tmp/smartdns-test -f -c /dev/null >/dev/null 2>&1
-            rc=$?
-            if [ "$rc" -eq 124 ] || [ "$rc" -eq 0 ]; then
+            if test_binary_safe /tmp/smartdns-test; then
                 mv /tmp/smartdns-test /usr/local/bin/smartdns
                 SMARTDNS_BIN="/usr/local/bin/smartdns"; SMARTDNS_SOURCE="GitHub"
+                print_test_result 0
             else
-                log_err "GitHub 二进制启动测试失败 (rc=$rc)，放弃"
+                print_test_result 1
                 rm -f /tmp/smartdns-test
             fi
         fi
@@ -210,7 +261,7 @@ module_install() {
 }
 
 #==================================================
-# 模块2: 生成配置与 DNS 模板
+# 模块2: 配置生成
 #==================================================
 module_config() {
     log_step "模块2: 生成配置与 DNS 模板"
@@ -227,7 +278,7 @@ module_config() {
         printf "nameserver 127.0.0.1\noptions edns0 trust-ad\n" > "$RESOLV_TEMPLATE"
         printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > "$RESOLV_FALLBACK"
     fi
-    log_ok "DNS 模板已生成: $RESOLV_TEMPLATE"
+    log_ok "DNS 模板已生成"
 
     [ "$TAKEOVER_STRATEGY" = "resolved" ] && systemctl stop systemd-resolved 2>/dev/null
 
@@ -244,13 +295,13 @@ module_config() {
     [ -z "$MODE" ] && MODE="doh_udp"
 
     write_config "$MODE"
-    log_ok "配置已生成: /etc/smartdns/smartdns.conf (上游模式: $MODE)"
+    log_ok "配置已生成 (上游模式: $MODE)"
 }
 
 write_config() {
     local mode="$1"
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.9.0 (包管理器兼容版)
+# SmartDNS 配置 v7.9.1
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 上游模式: $mode
@@ -261,9 +312,7 @@ prefetch-domain yes
 speed-check-mode tcp:443
 EOF
 
-    if [ "$HAS_IPV6" = false ]; then
-        echo "force-AAAA-SOA yes" >> /etc/smartdns/smartdns.conf
-    fi
+    [ "$HAS_IPV6" = false ] && echo "force-AAAA-SOA yes" >> /etc/smartdns/smartdns.conf
 
     case "$mode" in
         doh_udp)
@@ -289,7 +338,6 @@ EOF
             ;;
     esac
 
-    # 增强层：仅新版 + 非容器
     if [ "$IS_VER_NEW" = true ] && [ "$VIRT_IS_CONTAINER" = false ] && [ "$mode" = "doh_udp" ]; then
         cat >> /etc/smartdns/smartdns.conf << 'EOF'
 
@@ -329,7 +377,6 @@ module_dns_takeover() {
     BACKUP_LIST="/etc/smartdns/dns-config-backup.txt"
     > "$BACKUP_LIST"
 
-    # 1. systemd-resolved
     if [ "$INIT_TYPE" = "systemd" ] && command -v resolvectl >/dev/null 2>&1; then
         mkdir -p /etc/systemd/resolved.conf.d
         cat > /etc/systemd/resolved.conf.d/smartdns.conf << EOF
@@ -348,7 +395,6 @@ EOF
         log_info "systemd-resolved: 上游 → ${dns_list}"
     fi
 
-    # 2. dhclient
     if [ "$HAS_IPV4" = true ] && [ -f /etc/dhcp/dhclient.conf ]; then
         cp /etc/dhcp/dhclient.conf /etc/dhcp/dhclient.conf.smartdns.bak 2>/dev/null
         echo "/etc/dhcp/dhclient.conf:RESTORE:/etc/dhcp/dhclient.conf.smartdns.bak" >> "$BACKUP_LIST"
@@ -357,7 +403,6 @@ EOF
         log_info "dhclient: DNS → 127.0.0.1"
     fi
 
-    # 3. udhcpc
     if [ -f /etc/udhcpc/udhcpc.conf ]; then
         cp /etc/udhcpc/udhcpc.conf /etc/udhcpc/udhcpc.conf.smartdns.bak 2>/dev/null
         echo "/etc/udhcpc/udhcpc.conf:RESTORE:/etc/udhcpc/udhcpc.conf.smartdns.bak" >> "$BACKUP_LIST"
@@ -369,7 +414,6 @@ EOF
         log_info "udhcpc: 不再写 resolv.conf"
     fi
 
-    # 4. systemd-networkd
     if [ "$INIT_TYPE" = "systemd" ] && [ -d /etc/systemd/network ]; then
         for netconf in /etc/systemd/network/*.network; do
             [ -f "$netconf" ] || continue
@@ -381,7 +425,6 @@ EOF
         done
     fi
 
-    # 5. NetworkManager
     if command -v nmcli >/dev/null 2>&1; then
         local conn; conn=$(nmcli -t -f NAME con show --active 2>/dev/null | head -1)
         if [ -n "$conn" ]; then
@@ -398,7 +441,6 @@ EOF
         fi
     fi
 
-    # 6. Alpine ifupdown
     if [ -f /etc/network/interfaces ]; then
         if grep -q "iface.*inet dhcp" /etc/network/interfaces 2>/dev/null; then
             local iface4; iface4=$(grep "iface.*inet dhcp" /etc/network/interfaces | awk '{print $2}')
@@ -427,11 +469,9 @@ EOF
 
     if [ -L /etc/resolv.conf ]; then
         log_warn "resolv.conf 仍为软链接，强制替换"
-        rm -f /etc/resolv.conf
-        write_resolv
+        rm -f /etc/resolv.conf; write_resolv
     fi
 
-    # 第二层：启动覆盖
     if [ "$INIT_TYPE" = "openrc" ]; then
         mkdir -p /etc/local.d
         cat > /etc/local.d/resolv-fix.start << LSTART
@@ -461,7 +501,6 @@ SSTART
         log_ok "systemd oneshot 启动覆盖已创建"
     fi
 
-    # 第三层：文件守护
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
 TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"
@@ -543,7 +582,7 @@ PIDFile=/run/smartdns.pid
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
-# 注意：不设置 WatchdogSec，SmartDNS 不发送 WATCHDOG=1
+# 不设置 WatchdogSec
 [Install]
 WantedBy=multi-user.target
 SVC
@@ -680,7 +719,7 @@ module_uninstall() {
 }
 
 #==================================================
-# 模块7: 菜单（LXC 适配 + 崩溃显示）
+# 模块7: 菜单
 #==================================================
 install_shortcut() {
     local sp=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -779,7 +818,6 @@ do_switch_upstream() {
         2) MODE="udp_only" ;;
         *) return ;;
     esac
-    # 读取当前端口
     PORT=$(grep "^bind" /etc/smartdns/smartdns.conf 2>/dev/null | grep -o '[0-9]*$' | head -1)
     [ -z "$PORT" ] && PORT=53
     write_config "$MODE"
@@ -795,8 +833,9 @@ do_update() {
     printf "  安装来源: %s\n\n" "$SMARTDNS_SOURCE"
 
     printf "  1. 包管理器升级（apt/apk）\n"
-    printf "  2. 从 GitHub 下载最新版（需通过启动测试）\n"
-    printf "  3. 手动指定 GitHub 版本\n"
+    printf "  2. 从 GitHub 下载最新版（隔离启动测试）\n"
+    printf "  3. 手动指定 GitHub 版本（隔离启动测试）\n"
+    printf "  4. 恢复 Debian 源版本（apt --reinstall）\n"
     printf "  0. 返回\n\n"
     printf "  选择: "; read -r choice
 
@@ -811,6 +850,12 @@ do_update() {
             ;;
         2) TARGET_TAG="" ;;
         3) printf "  版本号(如 Release48.3): "; read -r TARGET_TAG ;;
+        4)
+            printf "  重新安装 Debian 源版本..."
+            apt-get install -y --reinstall smartdns 2>/dev/null && printf "%b✓%b\n" "$GREEN" "$NC" || printf "%b✗%b\n" "$RED" "$NC"
+            do_restart
+            return
+            ;;
         *) return ;;
     esac
 
@@ -821,23 +866,31 @@ do_update() {
         URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
     fi
 
-    printf "  下载并测试..."
-    if github_download "$URL" /tmp/smartdns-new; then
-        chmod +x /tmp/smartdns-new
-        timeout 5 /tmp/smartdns-new -f -c /dev/null >/dev/null 2>&1
-        rc=$?
-        if [ "$rc" -eq 124 ] || [ "$rc" -eq 0 ]; then
-            cp "$SMARTDNS_BIN" "${SMARTDNS_BIN}.bak" 2>/dev/null
-            mv /tmp/smartdns-new "$SMARTDNS_BIN"
-            chmod +x "$SMARTDNS_BIN"
-            do_restart
-            printf "%b✓ 切换完成%b\n" "$GREEN" "$NC"
-        else
-            printf "%b✗ 启动测试失败 (rc=%s)，已放弃%b\n" "$RED" "$rc" "$NC"
-            rm -f /tmp/smartdns-new
-        fi
+    printf "  下载中..."
+    if ! github_download "$URL" /tmp/smartdns-new; then
+        printf "%b✗ 下载失败%b\n" "$RED" "$NC"; return
+    fi
+    chmod +x /tmp/smartdns-new
+    printf "完成\n"
+
+    # 备份当前可用二进制（若尚未存在）
+    [ ! -f "/etc/smartdns/smartdns.bin.bak" ] && cp "$SMARTDNS_BIN" "/etc/smartdns/smartdns.bin.bak" 2>/dev/null
+
+    printf "  隔离启动测试（停服务 / 端口 15353 / 10s）...\n"
+    if test_binary_safe /tmp/smartdns-new; then
+        print_test_result 0
+        cp "$SMARTDNS_BIN" "${SMARTDNS_BIN}.prev" 2>/dev/null
+        mv /tmp/smartdns-new "$SMARTDNS_BIN"
+        chmod +x "$SMARTDNS_BIN"
+        SMARTDNS_VER=$("$SMARTDNS_BIN" -v 2>&1 | head -1)
+        SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
+        [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_VER_NEW=true || IS_VER_NEW=false
+        do_restart
+        printf "%b✓ 已切换到 %s%b\n" "$GREEN" "$SMARTDNS_VER" "$NC"
     else
-        printf "%b✗ 下载失败%b\n" "$RED" "$NC"
+        print_test_result 1
+        rm -f /tmp/smartdns-new
+        printf "%b已放弃切换，当前版本保持不变%b\n" "$YELLOW" "$NC"
     fi
 }
 
@@ -878,10 +931,10 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
 
-    printf "%bSmartDNS 智能部署 v7.9.0%b\n" "$BOLD$BLUE" "$NC"
-    printf "包管理器优先 | DoH 默认 + UDP 兜底 | systemd/OpenRC 双支持\n\n"
+    printf "%bSmartDNS 智能部署 v7.9.1%b\n" "$BOLD$BLUE" "$NC"
+    printf "包管理器优先 | 隔离启动测试 | DoH + UDP 兜底 | systemd/OpenRC\n\n"
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
-    printf "\n管理命令: %bsdns%b （菜单含崩溃/重启计数与上游切换）\n" "$GREEN" "$NC"
+    printf "\n管理命令: %bsdns%b\n" "$GREEN" "$NC"
     module_menu
 }
 
