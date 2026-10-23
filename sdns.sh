@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# sdns - SmartDNS 一键部署管理脚本 (Debian 12)
+# sdns - SmartDNS 一键部署管理脚本 (Debian 12/13)
 # 架构: 单文件 + 函数模块化 + 依赖管理 + 状态检测
 # =============================================================================
 
@@ -325,10 +325,8 @@ handle_port53() {
         return 0
     fi
 
-    local conflict_pid
-    conflict_pid=$(ss -lnptu 2>/dev/null | grep ':53 ' | awk '{print $6}' | cut -d= -f2 | head -1 || true)
-
-    if [[ -n "$conflict_pid" ]] && ps -p "$conflict_pid" -o comm= 2>/dev/null | grep -q systemd-resolved; then
+    # 优先通过 systemctl 判断 systemd-resolved 服务状态，避免 ss 进程名截断问题
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         log_warn "检测到 systemd-resolved 占用 53 端口，正在停止并禁用..."
         systemctl disable --now systemd-resolved 2>/dev/null || true
         sleep 1
@@ -440,12 +438,17 @@ takeover_dns() {
     log_info "接管系统 DNS..."
 
     if [[ ! -f "$RESOLV_BAK" ]]; then
-        cp /etc/resolv.conf "$RESOLV_BAK"
+        # -L 跟随符号链接复制实际内容
+        cp -L /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || cp /etc/resolv.conf "$RESOLV_BAK"
         log_info "已备份 /etc/resolv.conf -> $RESOLV_BAK"
     else
         log_warn "备份已存在，跳过: $RESOLV_BAK"
     fi
 
+    # 若为符号链接（Debian 13 常见），先移除再写入普通文件
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+    fi
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
 
     systemctl daemon-reload
@@ -509,10 +512,17 @@ uninstall_all() {
     systemctl daemon-reload
 
     if [[ -f "$RESOLV_BAK" ]]; then
+        # 若目标仍为符号链接，先移除再复制，避免写入链接目标
+        if [[ -L /etc/resolv.conf ]]; then
+            rm -f /etc/resolv.conf
+        fi
         cp "$RESOLV_BAK" /etc/resolv.conf
         rm -f "$RESOLV_BAK"
         log_info "已恢复 /etc/resolv.conf"
     else
+        if [[ -L /etc/resolv.conf ]]; then
+            rm -f /etc/resolv.conf
+        fi
         echo "nameserver 223.5.5.5" > /etc/resolv.conf
         log_warn "未找到备份，已写入兜底 DNS 223.5.5.5"
     fi
