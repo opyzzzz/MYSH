@@ -34,7 +34,7 @@ MOSDNS
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/mosdns.js | bash
 `````
 
-check-doh dns
+check-doh+tls dns
 `````
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/doh-check.sh | bash
 `````
